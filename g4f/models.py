@@ -1,232 +1,306 @@
-from g4f import Provider
+from __future__  import annotations
 
+from dataclasses import dataclass
 
+from .Provider import RetryProvider, ProviderType
+from .Provider   import (
+    Chatgpt4Online,
+    PerplexityLabs,
+    GeminiProChat,
+    ChatgptNext,
+    HuggingChat,
+    HuggingFace,
+    OpenaiChat,
+    ChatgptAi,
+    DeepInfra,
+    GigaChat,
+    Liaobots,
+    FreeGpt,
+    Llama2,
+    Vercel,
+    Gemini,
+    Bing,
+    You,
+    Pi,
+)
+
+@dataclass(unsafe_hash=True)
 class Model:
-    class model:
-        name: str
-        base_provider: str
-        best_provider: str
+    """
+    Represents a machine learning model configuration.
 
-    class gpt_35_turbo:
-        name: str = 'gpt-3.5-turbo'
-        base_provider: str = 'openai'
-        best_provider: Provider.Provider = Provider.Forefront
+    Attributes:
+        name (str): Name of the model.
+        base_provider (str): Default provider for the model.
+        best_provider (ProviderType): The preferred provider for the model, typically with retry logic.
+    """
+    name: str
+    base_provider: str
+    best_provider: ProviderType = None
 
-    class gpt_4:
-        name: str = 'gpt-4'
-        base_provider: str = 'openai'
-        best_provider: Provider.Provider = Provider.Bing
-        best_providers: list = [Provider.Bing, Provider.Lockchat]
+    @staticmethod
+    def __all__() -> list[str]:
+        """Returns a list of all model names."""
+        return _all_models
 
-    class claude_instant_v1_100k:
-        name: str = 'claude-instant-v1-100k'
-        base_provider: str = 'anthropic'
-        best_provider: Provider.Provider = Provider.Vercel
+default = Model(
+    name          = "",
+    base_provider = "",
+    best_provider = RetryProvider([
+        Bing,
+        ChatgptAi,
+        You,
+        Chatgpt4Online,
+        OpenaiChat
+    ])
+)
 
-    class claude_instant_v1:
-        name: str = 'claude-instant-v1'
-        base_provider: str = 'anthropic'
-        best_provider: Provider.Provider = Provider.Vercel
+# GPT-3.5 too, but all providers supports long requests and responses
+gpt_35_long = Model(
+    name          = 'gpt-3.5-turbo',
+    base_provider = 'openai',
+    best_provider = RetryProvider([
+        FreeGpt,
+        You,
+        ChatgptNext,
+        OpenaiChat,
+    ])
+)
 
-    class claude_v1_100k:
-        name: str = 'claude-v1-100k'
-        base_provider: str = 'anthropic'
-        best_provider: Provider.Provider = Provider.Vercel
+# GPT-3.5 / GPT-4
+gpt_35_turbo = Model(
+    name          = 'gpt-3.5-turbo',
+    base_provider = 'openai',
+    best_provider = OpenaiChat
+)
 
-    class claude_v1:
-        name: str = 'claude-v1'
-        base_provider: str = 'anthropic'
-        best_provider: Provider.Provider = Provider.Vercel
+gpt_4 = Model(
+    name          = 'gpt-4',
+    base_provider = 'openai',
+    best_provider = RetryProvider([
+        Bing, Liaobots, 
+    ])
+)
 
-    class alpaca_7b:
-        name: str = 'alpaca-7b'
-        base_provider: str = 'replicate'
-        best_provider: Provider.Provider = Provider.Vercel
+gpt_4_turbo = Model(
+    name          = 'gpt-4-turbo',
+    base_provider = 'openai',
+    best_provider = Bing
+)
 
-    class stablelm_tuned_alpha_7b:
-        name: str = 'stablelm-tuned-alpha-7b'
-        base_provider: str = 'replicate'
-        best_provider: Provider.Provider = Provider.Vercel
+gigachat = Model(
+    name          = 'GigaChat:latest',
+    base_provider = 'gigachat',
+    best_provider = GigaChat
+)
 
-    class bloom:
-        name: str = 'bloom'
-        base_provider: str = 'huggingface'
-        best_provider: Provider.Provider = Provider.Vercel
+gigachat_plus = Model(
+    name          = 'GigaChat-Plus',
+    base_provider = 'gigachat',
+    best_provider = GigaChat
+)
 
-    class bloomz:
-        name: str = 'bloomz'
-        base_provider: str = 'huggingface'
-        best_provider: Provider.Provider = Provider.Vercel
+gigachat_pro = Model(
+    name          = 'GigaChat-Pro',
+    base_provider = 'gigachat',
+    best_provider = GigaChat
+)
 
-    class flan_t5_xxl:
-        name: str = 'flan-t5-xxl'
-        base_provider: str = 'huggingface'
-        best_provider: Provider.Provider = Provider.Vercel
+llama2_7b = Model(
+    name          = "meta-llama/Llama-2-7b-chat-hf",
+    base_provider = 'meta',
+    best_provider = RetryProvider([Llama2, DeepInfra])
+)
 
-    class flan_ul2:
-        name: str = 'flan-ul2'
-        base_provider: str = 'huggingface'
-        best_provider: Provider.Provider = Provider.Vercel
+llama2_13b = Model(
+    name          = "meta-llama/Llama-2-13b-chat-hf",
+    base_provider = 'meta',
+    best_provider = RetryProvider([Llama2, DeepInfra])
+)
 
-    class gpt_neox_20b:
-        name: str = 'gpt-neox-20b'
-        base_provider: str = 'huggingface'
-        best_provider: Provider.Provider = Provider.Vercel
+llama2_70b = Model(
+    name          = "meta-llama/Llama-2-70b-chat-hf",
+    base_provider = "meta",
+    best_provider = RetryProvider([Llama2, DeepInfra, HuggingChat])
+)
 
-    class oasst_sft_4_pythia_12b_epoch_35:
-        name: str = 'oasst-sft-4-pythia-12b-epoch-3.5'
-        base_provider: str = 'huggingface'
-        best_provider: Provider.Provider = Provider.Vercel
+codellama_34b_instruct = Model(
+    name          = "codellama/CodeLlama-34b-Instruct-hf",
+    base_provider = "meta",
+    best_provider = RetryProvider([HuggingChat, DeepInfra])
+)
 
-    class santacoder:
-        name: str = 'santacoder'
-        base_provider: str = 'huggingface'
-        best_provider: Provider.Provider = Provider.Vercel
+codellama_70b_instruct = Model(
+    name          = "codellama/CodeLlama-70b-Instruct-hf",
+    base_provider = "meta",
+    best_provider = RetryProvider([DeepInfra, PerplexityLabs])
+)
 
-    class command_medium_nightly:
-        name: str = 'command-medium-nightly'
-        base_provider: str = 'cohere'
-        best_provider: Provider.Provider = Provider.Vercel
+# Mistral
+mixtral_8x7b = Model(
+    name          = "mistralai/Mixtral-8x7B-Instruct-v0.1",
+    base_provider = "huggingface",
+    best_provider = RetryProvider([DeepInfra, HuggingChat, HuggingFace, PerplexityLabs])
+)
 
-    class command_xlarge_nightly:
-        name: str = 'command-xlarge-nightly'
-        base_provider: str = 'cohere'
-        best_provider: Provider.Provider = Provider.Vercel
+mistral_7b = Model(
+    name          = "mistralai/Mistral-7B-Instruct-v0.1",
+    base_provider = "huggingface",
+    best_provider = RetryProvider([DeepInfra, HuggingChat, HuggingFace, PerplexityLabs])
+)
 
-    class code_cushman_001:
-        name: str = 'code-cushman-001'
-        base_provider: str = 'openai'
-        best_provider: Provider.Provider = Provider.Vercel
+# Misc models
+dolphin_mixtral_8x7b = Model(
+    name          = "cognitivecomputations/dolphin-2.6-mixtral-8x7b",
+    base_provider = "huggingface",
+    best_provider = DeepInfra
+)
 
-    class code_davinci_002:
-        name: str = 'code-davinci-002'
-        base_provider: str = 'openai'
-        best_provider: Provider.Provider = Provider.Vercel
+lzlv_70b = Model(
+    name          = "lizpreciatior/lzlv_70b_fp16_hf",
+    base_provider = "huggingface",
+    best_provider = DeepInfra
+)
 
-    class text_ada_001:
-        name: str = 'text-ada-001'
-        base_provider: str = 'openai'
-        best_provider: Provider.Provider = Provider.Vercel
+airoboros_70b = Model(
+    name          = "deepinfra/airoboros-70b",
+    base_provider = "huggingface",
+    best_provider = DeepInfra
+)
 
-    class text_babbage_001:
-        name: str = 'text-babbage-001'
-        base_provider: str = 'openai'
-        best_provider: Provider.Provider = Provider.Vercel
+airoboros_l2_70b = Model(
+    name          = "jondurbin/airoboros-l2-70b-gpt4-1.4.1",
+    base_provider = "huggingface",
+    best_provider = DeepInfra
+)
 
-    class text_curie_001:
-        name: str = 'text-curie-001'
-        base_provider: str = 'openai'
-        best_provider: Provider.Provider = Provider.Vercel
+openchat_35 = Model(
+    name          = "openchat/openchat_3.5",
+    base_provider = "huggingface",
+    best_provider = RetryProvider([DeepInfra, HuggingChat])
+)
 
-    class text_davinci_002:
-        name: str = 'text-davinci-002'
-        base_provider: str = 'openai'
-        best_provider: Provider.Provider = Provider.Vercel
+# Bard
+gemini = bard = palm = Model(
+    name          = 'gemini',
+    base_provider = 'google',
+    best_provider = Gemini
+)
 
-    class text_davinci_003:
-        name: str = 'text-davinci-003'
-        base_provider: str = 'openai'
-        best_provider: Provider.Provider = Provider.Vercel
-        
-    class palm:
-        name: str = 'palm'
-        base_provider: str = 'google'
-        best_provider: Provider.Provider = Provider.Bard
-        
-            
-    """    'falcon-40b': Model.falcon_40b,
-    'falcon-7b': Model.falcon_7b,
-    'llama-13b': Model.llama_13b,"""
-    
-    class falcon_40b:
-        name: str = 'falcon-40b'
-        base_provider: str = 'huggingface'
-        best_provider: Provider.Provider = Provider.H2o
-    
-    class falcon_7b:
-        name: str = 'falcon-7b'
-        base_provider: str = 'huggingface'
-        best_provider: Provider.Provider = Provider.H2o
-        
-    class llama_13b:
-        name: str = 'llama-13b'
-        base_provider: str = 'huggingface'
-        best_provider: Provider.Provider = Provider.H2o
-        
-    class gpt_35_turbo_16k:
-        name: str = 'gpt-3.5-turbo-16k'
-        base_provider: str = 'openai'
-        best_provider: Provider.Provider = Provider.EasyChat
-        
-    class gpt_35_turbo_0613:
-        name: str = 'gpt-3.5-turbo-0613'
-        base_provider: str = 'openai'
-        best_provider: Provider.Provider = Provider.EasyChat
-        
-    class gpt_35_turbo_16k_0613:
-        name: str = 'gpt-3.5-turbo-16k-0613'
-        base_provider: str = 'openai'
-        best_provider: Provider.Provider = Provider.EasyChat
-        
-    class gpt_4_32k:
-        name: str = 'gpt-4-32k'
-        base_provider: str = 'openai'
-        best_provider =  None
-        
-    class gpt_4_0613:
-        name: str = 'gpt-4-0613'
-        base_provider: str = 'openai'
-        best_provider = None
-    
+claude_v2 = Model(
+    name          = 'claude-v2',
+    base_provider = 'anthropic',
+    best_provider = RetryProvider([Vercel])
+)
+
+claude_3_opus = Model(
+    name          = 'claude-3-opus',
+    base_provider = 'anthropic',
+    best_provider = You
+)
+
+claude_3_sonnet = Model(
+    name          = 'claude-3-sonnet',
+    base_provider = 'anthropic',
+    best_provider = You
+)
+
+gpt_35_turbo_16k = Model(
+    name          = 'gpt-3.5-turbo-16k',
+    base_provider = 'openai',
+    best_provider = gpt_35_long.best_provider
+)
+
+gpt_35_turbo_16k_0613 = Model(
+    name          = 'gpt-3.5-turbo-16k-0613',
+    base_provider = 'openai',
+    best_provider = gpt_35_long.best_provider
+)
+
+gpt_35_turbo_0613 = Model(
+    name          = 'gpt-3.5-turbo-0613',
+    base_provider = 'openai',
+    best_provider = gpt_35_turbo.best_provider
+)
+
+gpt_4_0613 = Model(
+    name          = 'gpt-4-0613',
+    base_provider = 'openai',
+    best_provider = gpt_4.best_provider
+)
+
+gpt_4_32k = Model(
+    name          = 'gpt-4-32k',
+    base_provider = 'openai',
+    best_provider = gpt_4.best_provider
+)
+
+gpt_4_32k_0613 = Model(
+    name          = 'gpt-4-32k-0613',
+    base_provider = 'openai',
+    best_provider = gpt_4.best_provider
+)
+
+gemini_pro = Model(
+    name          = 'gemini-pro',
+    base_provider = 'google',
+    best_provider = RetryProvider([GeminiProChat, You])
+)
+
+pi = Model(
+    name = 'pi',
+    base_provider = 'inflection',
+    best_provider = Pi
+)
+
 class ModelUtils:
-    convert: dict = {
-        'gpt-3.5-turbo': Model.gpt_35_turbo,
-        'gpt-3.6-turbo-16k': Model.gpt_35_turbo_16k,
-        'gpt-3.5-turbo-0613': Model.gpt_35_turbo_0613,
-        'gpt-3.5-turbo-16k-0613': Model.gpt_35_turbo_16k_0613,
+    """
+    Utility class for mapping string identifiers to Model instances.
+
+    Attributes:
+        convert (dict[str, Model]): Dictionary mapping model string identifiers to Model instances.
+    """
+    convert: dict[str, Model] = {
+        # gpt-3.5
+        'gpt-3.5-turbo'          : gpt_35_turbo,
+        'gpt-3.5-turbo-0613'     : gpt_35_turbo_0613,
+        'gpt-3.5-turbo-16k'      : gpt_35_turbo_16k,
+        'gpt-3.5-turbo-16k-0613' : gpt_35_turbo_16k_0613,
         
-        'gpt-4': Model.gpt_4,
-        'gpt-4-32k': Model.gpt_4_32k,
-        'gpt-4-0613': Model.gpt_4_0613,
+        'gpt-3.5-long': gpt_35_long,
         
-        'claude-instant-v1-100k': Model.claude_instant_v1_100k,
-        'claude-v1-100k': Model.claude_v1_100k,
-        'claude-instant-v1': Model.claude_instant_v1,
-        'claude-v1': Model.claude_v1,
-        
-        'alpaca-7b': Model.alpaca_7b,
-        'stablelm-tuned-alpha-7b': Model.stablelm_tuned_alpha_7b,
-        
-        'bloom': Model.bloom,
-        'bloomz': Model.bloomz,
-        
-        'flan-t5-xxl': Model.flan_t5_xxl,
-        'flan-ul2': Model.flan_ul2,
-        
-        'gpt-neox-20b': Model.gpt_neox_20b,
-        'oasst-sft-4-pythia-12b-epoch-3.5': Model.oasst_sft_4_pythia_12b_epoch_35,
-        'santacoder': Model.santacoder,
-        
-        'command-medium-nightly': Model.command_medium_nightly,
-        'command-xlarge-nightly': Model.command_xlarge_nightly,
-        
-        'code-cushman-001': Model.code_cushman_001,
-        'code-davinci-002': Model.code_davinci_002,
-        
-        'text-ada-001': Model.text_ada_001,
-        'text-babbage-001': Model.text_babbage_001,
-        'text-curie-001': Model.text_curie_001,
-        'text-davinci-002': Model.text_davinci_002,
-        'text-davinci-003': Model.text_davinci_003,
-        
-        'palm2': Model.palm,
-        'palm': Model.palm,
-        'google': Model.palm,
-        'google-bard': Model.palm,
-        'google-palm': Model.palm,
-        'bard': Model.palm,
-        
-        'falcon-40b': Model.falcon_40b,
-        'falcon-7b': Model.falcon_7b,
-        'llama-13b': Model.llama_13b,
+        # gpt-4
+        'gpt-4'          : gpt_4,
+        'gpt-4-0613'     : gpt_4_0613,
+        'gpt-4-32k'      : gpt_4_32k,
+        'gpt-4-32k-0613' : gpt_4_32k_0613,
+        'gpt-4-turbo'    : gpt_4_turbo,
+
+        # Llama 2
+        'llama2-7b' : llama2_7b,
+        'llama2-13b': llama2_13b,
+        'llama2-70b': llama2_70b,
+        'codellama-34b-instruct': codellama_34b_instruct,
+        'codellama-70b-instruct': codellama_70b_instruct,
+
+        # GigaChat
+        'gigachat'     : gigachat,
+        'gigachat_plus': gigachat_plus,
+        'gigachat_pro' : gigachat_pro,
+
+        'mixtral-8x7b': mixtral_8x7b,
+        'mistral-7b': mistral_7b,
+        'dolphin-mixtral-8x7b': dolphin_mixtral_8x7b,
+        'lzlv-70b': lzlv_70b,
+        'airoboros-70b': airoboros_70b,
+        'airoboros-l2-70b': airoboros_l2_70b,
+        'openchat_3.5': openchat_35,
+        'gemini': gemini,
+        'gemini-pro': gemini_pro,
+        'claude-v2': claude_v2,
+        'claude-3-opus': claude_3_opus,
+        'claude-3-sonnet': claude_3_sonnet,
+        'pi': pi
     }
+
+_all_models = list(ModelUtils.convert.keys())
