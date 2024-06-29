@@ -1,51 +1,32 @@
 from __future__ import annotations
 
 import logging
-import json
+import os
 import os.path
-from typing import Iterator
-from uuid import uuid4
-from functools import partial
-
-try:
-    import webview
-    import platformdirs
-    from plyer import camera
-    from plyer import filechooser
-    app_storage_path = platformdirs.user_pictures_dir
-    user_select_image = partial(
-        filechooser.open_file,
-        path=platformdirs.user_pictures_dir(),
-        filters=[["Image", "*.jpg", "*.jpeg", "*.png", "*.webp", "*.svg"]],
-    )
-    has_plyer = True
-except ImportError:
-    has_plyer = False
-try:
-    from android.runnable import run_on_ui_thread
-    import android.permissions
-    from android.permissions import Permission
-    from android.permissions import _RequestPermissionsManager
-    _RequestPermissionsManager.register_callback()
-    from .android_gallery import user_select_image
-    has_android = True
-except:
-    run_on_ui_thread = lambda a : a
-    has_android = False
+import uuid
+import asyncio
+import time
+from aiohttp import ClientSession
+from typing import Iterator, Optional
+from flask import send_from_directory
 
 from g4f import version, models
 from g4f import get_last_provider, ChatCompletion
 from g4f.errors import VersionNotFoundError
+from g4f.typing import Cookies
+from g4f.image import ImagePreview, ImageResponse, is_accepted_format
+from g4f.requests.aiohttp import get_connector
 from g4f.Provider import ProviderType, __providers__, __map__
-from g4f.providers.base_provider import ProviderModelMixin
-from g4f.Provider.bing.create_images import patch_provider
+from g4f.providers.base_provider import ProviderModelMixin, FinishReason
 from g4f.providers.conversation import BaseConversation
 
 conversations: dict[dict[str, BaseConversation]] = {}
+images_dir = "./generated_images"
 
 class Api():
 
-    def get_models(self) -> list[str]:
+    @staticmethod
+    def get_models() -> list[str]:
         """
         Return a list of all models.
 
@@ -56,7 +37,8 @@ class Api():
         """
         return models._all_models
 
-    def get_provider_models(self, provider: str) -> list[dict]:
+    @staticmethod
+    def get_provider_models(provider: str) -> list[dict]:
         if provider in __map__:
             provider: ProviderType = __map__[provider]
             if issubclass(provider, ProviderModelMixin):
@@ -69,13 +51,59 @@ class Api():
             else:
                 return [];
 
-    def get_providers(self) -> list[str]:
+    @staticmethod
+    def get_image_models() -> list[dict]:
+        image_models = []
+        index = []
+        for provider in __providers__:
+            if hasattr(provider, "image_models"):
+                if hasattr(provider, "get_models"):
+                    provider.get_models()
+                parent = provider
+                if hasattr(provider, "parent"):
+                    parent = __map__[provider.parent]
+                if parent.__name__ not in index:
+                    for model in provider.image_models:
+                        image_models.append({
+                            "provider": parent.__name__,
+                            "url": parent.url,
+                            "label": parent.label if hasattr(parent, "label") else None,
+                            "image_model": model,
+                            "vision_model": parent.default_vision_model if hasattr(parent, "default_vision_model") else None
+                        })
+                        index.append(parent.__name__)
+            elif hasattr(provider, "default_vision_model") and provider.__name__ not in index:
+                image_models.append({
+                    "provider": provider.__name__,
+                    "url": provider.url,
+                    "label": provider.label if hasattr(provider, "label") else None,
+                    "image_model": None,
+                    "vision_model": provider.default_vision_model
+                })
+                index.append(provider.__name__)
+        return image_models
+
+    @staticmethod
+    def get_providers() -> list[str]:
         """
         Return a list of all working providers.
         """
-        return [provider.__name__ for provider in __providers__ if provider.working]
+        return {
+            provider.__name__: (provider.label
+                if hasattr(provider, "label")
+                else provider.__name__) +
+                (" (WebDriver)"
+                if "webdriver" in provider.get_parameters()
+                else "") + 
+                (" (Auth)"
+                if provider.needs_auth
+                else "")
+            for provider in __providers__
+            if provider.working
+        }
 
-    def get_version(self):
+    @staticmethod
+    def get_version():
         """
         Returns the current and latest version of the application.
 
@@ -91,83 +119,8 @@ class Api():
             "latest_version": version.utils.latest_version,
         }
 
-    def generate_title(self):
-        """
-        Generates and returns a title based on the request data.
-
-        Returns:
-            dict: A dictionary with the generated title.
-        """
-        return {'title': ''}
-
-    def get_conversation(self, options: dict, **kwargs) -> Iterator:
-        window = webview.windows[0]
-        if hasattr(self, "image") and self.image is not None:
-            kwargs["image"] = open(self.image, "rb")
-        for message in self._create_response_stream(
-            self._prepare_conversation_kwargs(options, kwargs),
-            options.get("conversation_id"),
-            options.get('provider')
-        ):
-            if not window.evaluate_js(f"if (!this.abort) this.add_message_chunk({json.dumps(message)}); !this.abort && !this.error;"):
-                break
-        self.image = None
-        self.set_selected(None)
-
-    @run_on_ui_thread
-    def choose_file(self):
-        self.request_permissions()
-        filechooser.open_file(
-            path=platformdirs.user_pictures_dir(),
-            on_selection=print
-        )
-
-    @run_on_ui_thread
-    def choose_image(self):
-        self.request_permissions()
-        user_select_image(
-            on_selection=self.on_image_selection
-        )
-
-    @run_on_ui_thread
-    def take_picture(self):
-        self.request_permissions()
-        filename = os.path.join(app_storage_path(), f"chat-{uuid4()}.png")
-        camera.take_picture(filename=filename, on_complete=self.on_camera)
-
-    def on_image_selection(self, filename):
-        filename = filename[0] if isinstance(filename, list) else filename
-        if filename is not None and os.path.exists(filename):
-            self.image = filename
-        else:
-            self.image = None
-        self.set_selected(None if self.image is None else "image")
-
-    def on_camera(self, filename):
-        if filename is not None and os.path.exists(filename):
-            self.image = filename
-        else:
-            self.image = None
-        self.set_selected(None if self.image is None else "camera")
-
-    def set_selected(self, input_id: str = None):
-        window = webview.windows[0]
-        if window is not None:
-            window.evaluate_js(
-                f"document.querySelector(`.image-label.selected`)?.classList.remove(`selected`);"
-            )
-            if input_id is not None and input_id in ("image", "camera"):
-                window.evaluate_js(
-                    f'document.querySelector(`label[for="{input_id}"]`)?.classList.add(`selected`);'
-                )
-
-    def request_permissions(self):
-        if has_android:
-            android.permissions.request_permissions([
-                Permission.CAMERA,
-                Permission.READ_EXTERNAL_STORAGE,
-                Permission.WRITE_EXTERNAL_STORAGE
-            ])
+    def serve_images(self, name):
+        return send_from_directory(os.path.abspath(images_dir), name)
 
     def _prepare_conversation_kwargs(self, json_data: dict, kwargs: dict):
         """
@@ -179,15 +132,14 @@ class Api():
         Returns:
             dict: Arguments prepared for chat completion.
         """ 
-        provider = json_data.get('provider', None)
-        if "image" in kwargs and provider is None:
-            provider = "Bing"
-        if provider == 'OpenaiChat':
-            kwargs['auto_continue'] = True
-
+        model = json_data.get('model') or models.default
+        provider = json_data.get('provider')
         messages = json_data['messages']
+        api_key = json_data.get("api_key")
+        if api_key is not None:
+            kwargs["api_key"] = api_key
         if json_data.get('web_search'):
-            if provider == "Bing":
+            if provider in ("Bing", "HuggingChat"):
                 kwargs['web_search'] = True
             else:
                 from .internet import get_search_message
@@ -197,17 +149,12 @@ class Api():
         if conversation_id and provider in conversations and conversation_id in conversations[provider]:
             kwargs["conversation"] = conversations[provider][conversation_id]
 
-        model = json_data.get('model')
-        model = model if model else models.default
-        patch = patch_provider if json_data.get('patch_provider') else None
-
         return {
             "model": model,
             "provider": provider,
             "messages": messages,
             "stream": True,
             "ignore_stream": True,
-            "patch_provider": patch,
             "return_conversation": True,
             **kwargs
         }
@@ -239,7 +186,30 @@ class Api():
                 elif isinstance(chunk, Exception):
                     logging.exception(chunk)
                     yield self._format_json("message", get_error_message(chunk))
-                else:
+                elif isinstance(chunk, ImagePreview):
+                    yield self._format_json("preview", chunk.to_string())
+                elif isinstance(chunk, ImageResponse):
+                    async def copy_images(images: list[str], cookies: Optional[Cookies] = None):
+                        async with ClientSession(
+                            connector=get_connector(None, os.environ.get("G4F_PROXY")),
+                            cookies=cookies
+                        ) as session:
+                            async def copy_image(image):
+                                async with session.get(image) as response:
+                                    target = os.path.join(images_dir, f"{int(time.time())}_{str(uuid.uuid4())}")
+                                    with open(target, "wb") as f:
+                                        async for chunk in response.content.iter_any():
+                                            f.write(chunk)
+                                    with open(target, "rb") as f:
+                                        extension = is_accepted_format(f.read(12)).split("/")[-1]
+                                        extension = "jpg" if extension == "jpeg" else extension
+                                    new_target = f"{target}.{extension}"
+                                    os.rename(target, new_target)
+                                    return f"/images/{os.path.basename(new_target)}"
+                            return await asyncio.gather(*[copy_image(image) for image in images])                                
+                    images = asyncio.run(copy_images(chunk.get_list(), chunk.options.get("cookies")))
+                    yield self._format_json("content", str(ImageResponse(images, chunk.alt)))
+                elif not isinstance(chunk, FinishReason):
                     yield self._format_json("content", str(chunk))
         except Exception as e:
             logging.exception(e)
@@ -260,7 +230,7 @@ class Api():
             'type': response_type,
             response_type: content
         }
-    
+
 def get_error_message(exception: Exception) -> str:
     """
     Generates a formatted error message from an exception.
@@ -271,4 +241,8 @@ def get_error_message(exception: Exception) -> str:
     Returns:
         str: A formatted error message string.
     """
-    return f"{get_last_provider().__name__}: {type(exception).__name__}: {exception}"
+    message = f"{type(exception).__name__}: {exception}"
+    provider = get_last_provider()
+    if provider is None:
+        return message
+    return f"{provider.__name__}: {message}"
