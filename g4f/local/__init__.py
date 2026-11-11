@@ -1,18 +1,22 @@
-from ..typing import Union, Iterator, Messages
-from ..stubs  import ChatCompletion, ChatCompletionChunk
-from ._engine import LocalProvider
-from ._models import models
-from ..client import iter_response, filter_none, IterResponse
+from __future__ import annotations
 
-class LocalClient():
+from ..typing import Union, Messages
+from ..locals.provider import LocalProvider
+from ..locals.models import get_models
+from ..client import iter_response, filter_none
+from ..client.types import IterResponse
+
+
+class LocalClient:
     def __init__(self, **kwargs) -> None:
         self.chat: Chat = Chat(self)
-    
+
     @staticmethod
     def list_models():
-        return list(models.keys())
-        
-class Completions():
+        return list(get_models())
+
+
+class Completions:
     def __init__(self, client: LocalClient):
         self.client: LocalClient = client
 
@@ -24,22 +28,24 @@ class Completions():
         response_format: dict = None,
         max_tokens: int = None,
         stop: Union[list[str], str] = None,
-        **kwargs
-    ) -> Union[ChatCompletion, Iterator[ChatCompletionChunk]]:
-
+        **kwargs,
+    ) -> IterResponse:
         stop = [stop] if isinstance(stop, str) else stop
         response = LocalProvider.create_completion(
-            model, messages, stream,            
+            model,
+            messages,
+            stream,
             **filter_none(
                 max_tokens=max_tokens,
                 stop=stop,
             ),
-            **kwargs
+            **kwargs,
         )
         response = iter_response(response, stream, response_format, max_tokens, stop)
         return response if stream else next(response)
 
-class Chat():
+
+class Chat:
     completions: Completions
 
     def __init__(self, client: LocalClient):

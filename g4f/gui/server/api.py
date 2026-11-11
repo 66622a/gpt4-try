@@ -1,274 +1,579 @@
 from __future__ import annotations
 
-import logging
+import inspect
 import json
-import os.path
+import logging
+import os
+import time
+import asyncio
+import threading
+from pathlib import Path
 from typing import Iterator
-from uuid import uuid4
-from functools import partial
+from flask import send_from_directory, request
+from inspect import signature
+import concurrent.futures
 
 try:
-    import webview
-    import platformdirs
-    from plyer import camera
-    from plyer import filechooser
-    app_storage_path = platformdirs.user_pictures_dir
-    user_select_image = partial(
-        filechooser.open_file,
-        path=platformdirs.user_pictures_dir(),
-        filters=[["Image", "*.jpg", "*.jpeg", "*.png", "*.webp", "*.svg"]],
-    )
-    has_plyer = True
+    from PIL import Image
+
+    has_pillow = True
 except ImportError:
-    has_plyer = False
-try:
-    from android.runnable import run_on_ui_thread
-    import android.permissions
-    from android.permissions import Permission
-    from android.permissions import _RequestPermissionsManager
-    _RequestPermissionsManager.register_callback()
-    from .android_gallery import user_select_image
-    has_android = True
-except:
-    run_on_ui_thread = lambda a : a
-    has_android = False
+    has_pillow = False
 
-from g4f import version, models
-from g4f import get_last_provider, ChatCompletion
-from g4f.errors import VersionNotFoundError
-from g4f.Provider import ProviderType, __providers__, __map__
-from g4f.providers.base_provider import ProviderModelMixin
-from g4f.Provider.bing.create_images import patch_provider
-from g4f.providers.conversation import BaseConversation
+from ...errors import VersionNotFoundError, MissingAuthError
+from ...image.copy_images import copy_media, ensure_media_dir, get_media_dir
+from ...image import get_width_height
+from ...tools.run_tools import iter_run_tools
+from ...providers.base_provider import ProviderModelMixin
+from ...providers.retry_provider import BaseRetryProvider
+from ...providers.helper import format_media_prompt
+from ...providers.response import *
+from ...providers.any_model_map import model_map
+from ...providers.any_provider import AnyProvider
+from ...providers.cache import FileStorage
+from ...config import AppConfig
+from ...version import utils as version_utils
+from ...Provider import ProviderLoader
+from ... import Provider
+from ... import debug
 
-conversations: dict[dict[str, BaseConversation]] = {}
+logger = logging.getLogger(__name__)
+storage = FileStorage()
 
-class Api():
+# Refresh the packaged providers.json cache after this many seconds.
+PROVIDERS_CACHE_TTL = 5 * 60
+# Set to False when the packaged cache file cannot be written (e.g. read-only install).
+_providers_cache_writable = True
 
-    def get_models(self) -> list[str]:
-        """
-        Return a list of all models.
 
-        Fetches and returns a list of all available models in the system.
+def _normalize_version(version):
+    """Return a version string without a leading ``v`` (e.g. ``v8.8.3`` -> ``8.8.3``)."""
+    if isinstance(version, str) and version.startswith("v"):
+        return version[1:]
+    return version
 
-        Returns:
-            List[str]: A list of model names.
-        """
-        return models._all_models
 
-    def get_provider_models(self, provider: str) -> list[dict]:
-        if provider in __map__:
-            provider: ProviderType = __map__[provider]
-            if issubclass(provider, ProviderModelMixin):
-                return [{"model": model, "default": model == provider.default_model} for model in provider.get_models()]
-            elif provider.supports_gpt_35_turbo or provider.supports_gpt_4:
-                return [
-                    *([{"model": "gpt-4", "default": not provider.supports_gpt_4}] if provider.supports_gpt_4 else []),
-                    *([{"model": "gpt-3.5-turbo", "default": not provider.supports_gpt_4}] if provider.supports_gpt_35_turbo else [])
-                ]
-            else:
-                return [];
+class Api:
+    models_lock = threading.RLock()
+    providers_lock = threading.Lock()
+    # In-memory caches: the GUI requests provider/model lists several times
+    # while initializing /chat/, so avoid re-reading the disk cache or
+    # rebuilding the same lists on every request.
+    _providers_memory_cache = None
+    _providers_memory_key = None
+    _providers_memory_at = 0.0
+    _models_memory_cache = None
+    _models_memory_at = 0.0
+    PROVIDERS_MEMORY_TTL = 30.0
+    MODELS_MEMORY_TTL = 5 * 60
 
-    def get_providers(self) -> list[str]:
-        """
-        Return a list of all working providers.
-        """
-        return [provider.__name__ for provider in __providers__ if provider.working]
-
-    def get_version(self):
-        """
-        Returns the current and latest version of the application.
-
-        Returns:
-            dict: A dictionary containing the current and latest version.
-        """
+    @staticmethod
+    async def get_provider_models(
+        provider: str, api_key: "str | None" = None, base_url: "str | None" = None, ignored: "list | None" = None
+    ):
+        def get_model_data(
+            provider: ProviderModelMixin, model: str, default: bool = False
+        ) -> dict:
+            model_id = model.get("id") if isinstance(model, dict) else model
+            return {
+                "id": model_id,
+                "label": model_id,
+                "default": default or model_id == provider.default_model,
+                "vision": model_id in provider.vision_models,
+                "audio": False
+                if provider.audio_models is None
+                else model_id in provider.audio_models,
+                "video": model_id in provider.video_models,
+                "image": model_id in provider.image_models,
+                "count": False
+                if provider.models_count is None
+                else provider.models_count.get(model_id),
+                "tags": []
+                if provider.models_tags is None
+                else provider.models_tags.get(model_id, []),
+                **(model if isinstance(model, dict) else {}),
+            }
         try:
-            current_version = version.utils.current_version
-        except VersionNotFoundError:
-            current_version = None
+            provider = ProviderLoader.from_name(provider)
+            if issubclass(provider, ProviderModelMixin):
+                has_grouped_models = hasattr(provider, "get_grouped_models")
+                method = (
+                    provider.get_grouped_models
+                    if has_grouped_models
+                    else provider.get_models
+                )
+                if "api_key" in signature(provider.get_models).parameters:
+                    models = method(api_key=api_key, base_url=base_url)
+                elif "ignored" in signature(provider.get_models).parameters:
+                    models = method(ignored=ignored)
+                else:
+                    models = method()
+                if inspect.isawaitable(models):
+                    models = await models
+                if has_grouped_models:
+                    return [
+                        {
+                            "group": model.get("group"),
+                            "models": [
+                                get_model_data(provider, name)
+                                for name in (
+                                    model.get("models", {}).values()
+                                    if isinstance(model.get("models"), dict)
+                                    else model.get("models", [])
+                                )
+                            ],
+                        }
+                        if model.get("models")
+                        else model
+                        for model in models
+                    ]
+                if isinstance(models, dict):
+                    models = [{"id": key, **value} for key, value in models.items()]
+                return [
+                    get_model_data(provider, model)
+                    for model in models
+                ]
+            elif hasattr(provider, "models"):
+                return provider.models
+        except ImportError as e:
+            debug.log(f"Error getting provider models for {provider}:", e)
+        if provider in model_map:
+            return [get_model_data(AnyProvider, provider, True)]
+
+        return []
+
+    @staticmethod
+    def _provider_info(provider) -> dict:
         return {
-            "version": current_version,
-            "latest_version": version.utils.latest_version,
+            "name": provider.__name__,
+            "label": getattr(provider, "label", provider.__name__),
+            "parent": getattr(provider, "parent", None),
+            "image": len(getattr(provider, "image_models", [])),
+            "audio": len(getattr(provider, "audio_models", [])),
+            "video": len(getattr(provider, "video_models", [])),
+            "vision": getattr(provider, "default_vision_model", None) is not None,
+            "nodriver": getattr(provider, "use_nodriver", False),
+            "hf_space": getattr(provider, "hf_space", False),
+            "active_by_default": False
+            if provider.active_by_default is None
+            else provider.active_by_default,
+            "auth": provider.needs_auth,
+            "login_url": getattr(provider, "login_url", None),
+            "live": provider.live,
+            "login": hasattr(provider, "login"),
         }
 
-    def generate_title(self):
-        """
-        Generates and returns a title based on the request data.
+    @staticmethod
+    def _with_any_provider(providers: list[dict]) -> list[dict]:
+        if any(provider.get("name") == AnyProvider.__name__ for provider in providers):
+            return providers
+        return [Api._provider_info(AnyProvider), *providers]
 
-        Returns:
-            dict: A dictionary with the generated title.
-        """
-        return {'title': ''}
-
-    def get_conversation(self, options: dict, **kwargs) -> Iterator:
-        window = webview.windows[0]
-        if hasattr(self, "image") and self.image is not None:
-            kwargs["image"] = open(self.image, "rb")
-        for message in self._create_response_stream(
-            self._prepare_conversation_kwargs(options, kwargs),
-            options.get("conversation_id"),
-            options.get('provider')
+    @staticmethod
+    def get_providers() -> list[dict]:
+        cache_key = tuple(ProviderLoader.ignored)
+        now = time.monotonic()
+        cached = Api._providers_memory_cache
+        if (
+            cached is not None
+            and Api._providers_memory_key == cache_key
+            and now - Api._providers_memory_at < Api.PROVIDERS_MEMORY_TTL
         ):
-            if not window.evaluate_js(f"if (!this.abort) this.add_message_chunk({json.dumps(message)}); !this.abort && !this.error;"):
-                break
-        self.image = None
-        self.set_selected(None)
+            return cached
+        with Api.providers_lock:
+            # Re-check after acquiring the lock: concurrent GUI requests
+            # (providers, status, chat) should only build this list once.
+            now = time.monotonic()
+            cached = Api._providers_memory_cache
+            if (
+                cached is not None
+                and Api._providers_memory_key == cache_key
+                and now - Api._providers_memory_at < Api.PROVIDERS_MEMORY_TTL
+            ):
+                return cached
+            if not ProviderLoader.ignored:
+                on_disk = Api._read_providers_cache()
+                if on_disk is not None:
+                    result = Api._with_any_provider(on_disk)
+                    Api._providers_memory_cache = result
+                    Api._providers_memory_key = cache_key
+                    Api._providers_memory_at = now
+                    return result
+                if not _providers_cache_writable:
+                    saved = storage.get(f"{version_utils.current_version}/providers")
+                    if saved is not None:
+                        result = Api._with_any_provider(saved)
+                        Api._providers_memory_cache = result
+                        Api._providers_memory_key = cache_key
+                        Api._providers_memory_at = now
+                        return result
+            result = [
+                Api._provider_info(provider)
+                for provider in Provider.__providers__
+                if provider.working
+            ]
+            result = Api._with_any_provider(result)
+            storage.set(f"{version_utils.current_version}/providers", result)
+            Api._write_providers_cache(result)
+            Api._providers_memory_cache = result
+            Api._providers_memory_key = cache_key
+            Api._providers_memory_at = now
+            return result
 
-    @run_on_ui_thread
-    def choose_file(self):
-        self.request_permissions()
-        filechooser.open_file(
-            path=platformdirs.user_pictures_dir(),
-            on_selection=print
-        )
+    @staticmethod
+    def _providers_cache_file() -> Path:
+        return Path(__file__).resolve().parents[2] / "providers.json"
 
-    @run_on_ui_thread
-    def choose_image(self):
-        self.request_permissions()
-        user_select_image(
-            on_selection=self.on_image_selection
-        )
+    @staticmethod
+    def _write_providers_cache(result: list) -> bool:
+        """Persist the provider list to a JSON file inside the g4f package."""
+        global _providers_cache_writable
+        if not _providers_cache_writable:
+            return False
+        try:
+            with open(Api._providers_cache_file(), "w", encoding="utf-8") as f:
+                json.dump(result, f, indent=2)
+            return True
+        except OSError as e:
+            logger.warning(f"Failed to write providers cache: {e}")
+            _providers_cache_writable = False
+            return False
 
-    @run_on_ui_thread
-    def take_picture(self):
-        self.request_permissions()
-        filename = os.path.join(app_storage_path(), f"chat-{uuid4()}.png")
-        camera.take_picture(filename=filename, on_complete=self.on_camera)
+    @staticmethod
+    def _read_providers_cache() -> list | None:
+        """Read the packaged provider list, returning None when missing or stale."""
+        try:
+            cache_file = Api._providers_cache_file()
+            if not cache_file.exists():
+                return None
+            if AppConfig.dev and not AppConfig.demo:
+                if time.time() - cache_file.stat().st_mtime > PROVIDERS_CACHE_TTL:
+                    return None
+            with open(cache_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(f"Failed to read providers cache: {e}")
+            return None
 
-    def on_image_selection(self, filename):
-        filename = filename[0] if isinstance(filename, list) else filename
-        if filename is not None and os.path.exists(filename):
-            self.image = filename
-        else:
-            self.image = None
-        self.set_selected(None if self.image is None else "image")
+    def get_all_models(self) -> dict[str, list]:
+        now = time.monotonic()
+        cached = Api._models_memory_cache
+        if (
+            cached is not None
+            and now - Api._models_memory_at < Api.MODELS_MEMORY_TTL
+        ):
+            return cached
+        with self.models_lock:
+            now = time.monotonic()
+            cached = Api._models_memory_cache
+            if (
+                cached is not None
+                and now - Api._models_memory_at < Api.MODELS_MEMORY_TTL
+            ):
+                return cached
+            result = self._load_all_models()
+            Api._models_memory_cache = result
+            Api._models_memory_at = now
+            return result
 
-    def on_camera(self, filename):
-        if filename is not None and os.path.exists(filename):
-            self.image = filename
-        else:
-            self.image = None
-        self.set_selected(None if self.image is None else "camera")
+    def _load_all_models(self) -> dict[str, list]:
+        storage_key = f"{version_utils.current_version}/all_models"
+        saved = storage.get(storage_key)
+        if saved is not None:
+            return saved
+        with self.models_lock:
 
-    def set_selected(self, input_id: str = None):
-        window = webview.windows[0]
-        if window is not None:
-            window.evaluate_js(
-                f"document.querySelector(`.image-label.selected`)?.classList.remove(`selected`);"
+            def safe_get_provider_models(provider) -> tuple[str, list[str]]:
+                try:
+                    models = provider.get_models(timeout=10)
+                    if inspect.isawaitable(models):
+                        models = asyncio.run(models)
+                    return provider.__name__, list(models)
+                except MissingAuthError as e:
+                    return provider.__name__, []
+                except Exception as e:
+                    debug.error(f"{provider.__name__}: get_models error:", e)
+                    return provider.__name__, []
+
+            providers = [
+                p
+                for p in Provider.__providers__
+                if p.working and hasattr(p, "get_models")
+            ]
+            results = {}
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+                futures = {
+                    executor.submit(safe_get_provider_models, p): p for p in providers
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    name, models = future.result()
+                    results[name] = models
+
+            storage.set(storage_key, results)
+            return results
+
+    @staticmethod
+    def get_version() -> dict:
+        current_version = None
+        latest_version = None
+        try:
+            current_version = version_utils.current_version
+            try:
+                if request.args.get("cache"):
+                    latest_version = version_utils.latest_version_cached
+            except RuntimeError:
+                pass
+            if latest_version is None:
+                latest_version = version_utils.latest_version
+        except VersionNotFoundError:
+            pass
+        return {
+            "version": _normalize_version(current_version),
+            "latest_version": _normalize_version(latest_version),
+        }
+
+    def serve_images(self, name):
+        ensure_media_dir()
+        return send_from_directory(os.path.abspath(get_media_dir()), name)
+
+    def _prepare_conversation_kwargs(self, json_data: dict):
+        kwargs = {**json_data}
+        model = kwargs.pop("model", None)
+        provider = kwargs.pop("provider", None)
+        messages = kwargs.pop("messages", None)
+        action = kwargs.get("action")
+        if action == "continue":
+            if "tool_calls" not in kwargs:
+                kwargs["tool_calls"] = []
+            kwargs["tool_calls"].append(
+                {"function": {"name": "continue_tool"}, "type": "function"}
             )
-            if input_id is not None and input_id in ("image", "camera"):
-                window.evaluate_js(
-                    f'document.querySelector(`label[for="{input_id}"]`)?.classList.add(`selected`);'
-                )
-
-    def request_permissions(self):
-        if has_android:
-            android.permissions.request_permissions([
-                Permission.CAMERA,
-                Permission.READ_EXTERNAL_STORAGE,
-                Permission.WRITE_EXTERNAL_STORAGE
-            ])
-
-    def _prepare_conversation_kwargs(self, json_data: dict, kwargs: dict):
-        """
-        Prepares arguments for chat completion based on the request data.
-
-        Reads the request and prepares the necessary arguments for handling 
-        a chat completion request.
-
-        Returns:
-            dict: Arguments prepared for chat completion.
-        """ 
-        provider = json_data.get('provider', None)
-        if "image" in kwargs and provider is None:
-            provider = "Bing"
-        if provider == 'OpenaiChat':
-            kwargs['auto_continue'] = True
-
-        messages = json_data['messages']
-        if json_data.get('web_search'):
-            if provider == "Bing":
-                kwargs['web_search'] = True
-            else:
-                from .internet import get_search_message
-                messages[-1]["content"] = get_search_message(messages[-1]["content"])
-
-        conversation_id = json_data.get("conversation_id")
-        if conversation_id and provider in conversations and conversation_id in conversations[provider]:
-            kwargs["conversation"] = conversations[provider][conversation_id]
-
-        model = json_data.get('model')
-        model = model if model else models.default
-        patch = patch_provider if json_data.get('patch_provider') else None
-
+        conversation = kwargs.pop("conversation", None)
+        if isinstance(conversation, dict):
+            kwargs["conversation"] = JsonConversation(**conversation)
         return {
             "model": model,
             "provider": provider,
             "messages": messages,
-            "stream": True,
             "ignore_stream": True,
-            "patch_provider": patch,
-            "return_conversation": True,
-            **kwargs
+            **kwargs,
         }
 
-    def _create_response_stream(self, kwargs: dict, conversation_id: str, provider: str) -> Iterator:
-        """
-        Creates and returns a streaming response for the conversation.
+    def _create_response_stream(
+        self,
+        kwargs: dict,
+        provider: str,
+        download_media: bool = True,
+        tempfiles: list[str] = [],
+    ) -> Iterator:
+        def decorated_log(*values: str, file=None):
+            debug.logs.append(" ".join([str(value) for value in values]))
+            if debug.logging:
+                debug.log_handler(*values, file=file)
 
-        Args:
-            kwargs (dict): Arguments for creating the chat completion.
-
-        Yields:
-            str: JSON formatted response chunks for the stream.
-
-        Raises:
-            Exception: If an error occurs during the streaming process.
-        """
+        debug.log = decorated_log
+        proxy = os.environ.get("G4F_PROXY")
         try:
-            first = True
-            for chunk in ChatCompletion.create(**kwargs):
-                if first:
-                    first = False
-                    yield self._format_json("provider", get_last_provider(True))
-                if isinstance(chunk, BaseConversation):
-                    if provider not in conversations:
-                        conversations[provider] = {}
-                    conversations[provider][conversation_id] = chunk
-                    yield self._format_json("conversation", conversation_id)
+            model = kwargs.get("model")
+            provider_handler = provider or AnyProvider
+            provider = provider_handler.__name__ if provider_handler else provider
+            if "user" in kwargs:
+                debug.error("User:", kwargs.get("user", "Unknown"))
+                debug.error("Referrer:", kwargs.get("referer", ""))
+                debug.error("User-Agent:", kwargs.get("user-agent", ""))
+        except Exception as e:
+            logger.exception(e)
+            yield self._format_json(
+                "error", type(e).__name__, message=get_error_message(e)
+            )
+            return
+        if not isinstance(provider_handler, BaseRetryProvider):
+            yield self.handle_provider(provider_handler, model)
+            if hasattr(provider_handler, "get_parameters"):
+                yield self._format_json(
+                    "parameters", provider_handler.get_parameters(as_json=True)
+                )
+        try:
+            result = iter_run_tools(
+                provider_handler,
+                **{
+                    **kwargs,
+                    "model": model,
+                    "download_media": download_media,
+                    "proxy": proxy,
+                },
+            )
+            for chunk in result:
+                if isinstance(chunk, ProviderInfo):
+                    model = getattr(chunk, "model", model)
+                    provider = getattr(chunk, "provider", provider)
+                    yield self.handle_provider(chunk, model)
+                elif isinstance(chunk, JsonConversation):
+                    if provider is not None:
+                        yield self._format_json(
+                            "conversation",
+                            chunk.get_dict()
+                            if provider == "AnyProvider"
+                            else {provider: chunk.get_dict()},
+                        )
                 elif isinstance(chunk, Exception):
-                    logging.exception(chunk)
-                    yield self._format_json("message", get_error_message(chunk))
+                    logger.exception(chunk)
+                    yield self._format_json(
+                        "message", get_error_message(chunk), error=type(chunk).__name__
+                    )
+                elif isinstance(chunk, RequestLogin):
+                    yield self._format_json("preview", chunk.to_string())
+                elif isinstance(chunk, PreviewResponse):
+                    yield self._format_json("preview", chunk.to_string())
+                elif isinstance(chunk, ImagePreview):
+                    yield self._format_json(
+                        "preview", chunk.to_string(), urls=chunk.urls, alt=chunk.alt
+                    )
+                elif isinstance(chunk, MediaResponse):
+                    media = chunk
+                    if download_media or chunk.get("cookies") or chunk.get("headers"):
+                        chunk.alt = format_media_prompt(
+                            kwargs.get("messages"), chunk.alt
+                        )
+                        width, height = get_width_height(
+                            chunk.get("width"), chunk.get("height")
+                        )
+                        tags = [
+                            model,
+                            kwargs.get("aspect_ratio"),
+                            kwargs.get("resolution"),
+                        ]
+                        media = asyncio.run(
+                            copy_media(
+                                chunk.get_list(),
+                                chunk.get("cookies"),
+                                chunk.get("headers"),
+                                proxy=proxy,
+                                alt=chunk.alt,
+                                tags=tags,
+                                add_url=True,
+                                timeout=kwargs.get("timeout"),
+                                return_target=True
+                                if isinstance(chunk, ImageResponse)
+                                else False,
+                            )
+                        )
+                        options = {}
+                        target_paths, urls = get_target_paths_and_urls(media)
+                        if target_paths:
+                            if has_pillow:
+                                try:
+                                    with Image.open(target_paths[0]) as img:
+                                        width, height = img.size
+                                        options = {"width": width, "height": height}
+                                except Exception as e:
+                                    logger.exception(e)
+                            options["target_paths"] = target_paths
+                        media = (
+                            ImageResponse(urls, chunk.alt, options)
+                            if isinstance(chunk, ImageResponse)
+                            else VideoResponse(media, chunk.alt)
+                        )
+                    yield self._format_json(
+                        "content", str(media), urls=media.urls, alt=media.alt
+                    )
+                elif isinstance(chunk, SynthesizeData):
+                    yield self._format_json("synthesize", chunk.get_dict())
+                elif isinstance(chunk, TitleGeneration):
+                    yield self._format_json("title", chunk.title)
+                elif isinstance(chunk, Parameters):
+                    yield self._format_json("parameters", chunk.get_dict())
+                elif isinstance(chunk, FinishReason):
+                    yield self._format_json("finish", chunk.get_dict())
+                elif isinstance(chunk, Usage):
+                    yield self._format_json(
+                        "usage", chunk.get_dict(), model=model, provider=provider
+                    )
+                elif isinstance(chunk, Reasoning):
+                    yield self._format_json("reasoning", **chunk.get_dict())
+                elif isinstance(chunk, YouTubeResponse):
+                    yield self._format_json("content", chunk.to_string())
+                elif isinstance(chunk, AudioResponse):
+                    yield self._format_json("content", str(chunk), data=chunk.data)
+                elif isinstance(chunk, SuggestedFollowups):
+                    yield self._format_json("suggestions", chunk.suggestions)
+                elif isinstance(chunk, DebugResponse):
+                    yield self._format_json("log", chunk.log)
+                elif isinstance(chunk, ContinueResponse):
+                    yield self._format_json("continue", chunk.text)
+                elif isinstance(chunk, VariantResponse):
+                    yield self._format_json("variant", chunk.text)
+                elif isinstance(chunk, ToolCalls):
+                    yield self._format_json("tool_calls", chunk.list)
+                elif isinstance(chunk, RawResponse):
+                    yield self._format_json(chunk.type, **chunk.get_dict())
+                elif isinstance(chunk, JsonRequest):
+                    yield self._format_json("request", chunk.get_dict())
+                elif isinstance(chunk, JsonResponse):
+                    yield self._format_json("response", chunk.get_dict())
+                elif isinstance(chunk, PlainTextResponse):
+                    yield self._format_json("response", chunk.text)
+                elif isinstance(chunk, HeadersResponse):
+                    yield self._format_json("headers", chunk.get_dict())
                 else:
                     yield self._format_json("content", str(chunk))
+        except MissingAuthError as e:
+            yield self._format_json(
+                "auth", type(e).__name__, message=get_error_message(e)
+            )
+        except (TimeoutError, asyncio.exceptions.CancelledError) as e:
+            if "user" in kwargs:
+                debug.error(e, "User:", kwargs.get("user", "Unknown"))
+            yield self._format_json(
+                "error", type(e).__name__, message=get_error_message(e)
+            )
         except Exception as e:
-            logging.exception(e)
-            yield self._format_json('error', get_error_message(e))
+            if "user" in kwargs:
+                debug.error(e, "User:", kwargs.get("user", "Unknown"))
+            logger.exception(e)
+            yield self._format_json(
+                "error", type(e).__name__, message=get_error_message(e)
+            )
+        finally:
+            yield from self._yield_logs()
+            for tempfile in tempfiles:
+                try:
+                    os.remove(tempfile)
+                except Exception as e:
+                    logger.exception(e)
 
-    def _format_json(self, response_type: str, content):
-        """
-        Formats and returns a JSON response.
+    def _yield_logs(self):
+        if debug.logs:
+            for log in debug.logs:
+                yield self._format_json("log", log)
+            debug.logs = []
 
-        Args:
-            response_type (str): The type of the response.
-            content: The content to be included in the response.
+    def _format_json(self, response_type: str, content=None, **kwargs):
+        if content is not None and isinstance(response_type, str):
+            return {"type": response_type, response_type: content, **kwargs}
+        return {"type": response_type, **kwargs}
 
-        Returns:
-            str: A JSON formatted string.
-        """
-        return {
-            'type': response_type,
-            response_type: content
-        }
-    
+    def handle_provider(self, provider_handler, model):
+        if not getattr(provider_handler, "model", False):
+            return self._format_json(
+                "provider", {**provider_handler.get_dict(), "model": model}
+            )
+        return self._format_json("provider", provider_handler.get_dict())
+
+
 def get_error_message(exception: Exception) -> str:
-    """
-    Generates a formatted error message from an exception.
+    return f"{type(exception).__name__}: {exception}"
 
-    Args:
-        exception (Exception): The exception to format.
 
-    Returns:
-        str: A formatted error message string.
-    """
-    return f"{get_last_provider().__name__}: {type(exception).__name__}: {exception}"
+def get_target_paths_and_urls(
+    media: list[Union[str, tuple[str, str]]]
+) -> tuple[list[str], list[str]]:
+    target_paths = []
+    urls = []
+    for item in media:
+        if isinstance(item, tuple):
+            item, target_path = item
+            target_paths.append(target_path)
+        urls.append(item)
+    return target_paths, urls
